@@ -1,0 +1,138 @@
+# multi-claude
+
+One Claude Code account per working directory.
+
+Claude Code holds one logged-in account per config directory, so juggling a work org and a
+personal subscription normally means logging out and back in — losing session history each
+time. `multi-claude` is a small POSIX shell wrapper that shadows `claude` in your `PATH`,
+works out which account the current directory belongs to, points `CLAUDE_CONFIG_DIR` at that
+profile, and hands over to the real `claude`.
+
+```
+cd ~/work/api      && claude   # work account
+cd ~/side-project  && claude   # personal account
+```
+
+The first time you run `claude` somewhere new it asks which account to use and remembers the
+answer. Nothing else changes: login, updates, and every flag are still the real `claude`.
+
+No dependencies beyond what ships with macOS and Ubuntu LTS.
+
+## Install
+
+```sh
+git clone <this repo> ~/src/multi-claude
+cd ~/src/multi-claude
+./install.sh
+```
+
+The installer symlinks the wrapper into `~/.multi-claude/bin/` and prints the one `PATH` line
+to add to your shell startup file. It edits none of your files, and it never touches
+`~/.local/bin/claude` — that symlink belongs to `claude update`.
+
+The `PATH` line must come *after* anything that adds the real `claude` to your `PATH`, or the
+wrapper is shadowed instead of shadowing. Re-run `./install.sh` at any time to check; it
+reports which of the two wins. Confirm with:
+
+```sh
+command -v claude   # should print ~/.multi-claude/bin/claude
+```
+
+Because the shim is a symlink into the clone, `git pull` updates the tool in place.
+
+## Usage
+
+```
+claude profile              pick the profile for this directory
+claude profile list         show profiles and their accounts
+claude profile use NAME     map this directory to NAME
+claude profile unset        drop this directory's mapping
+claude profile new NAME     create a profile
+claude profile rm NAME      delete a profile
+```
+
+Everything else passes straight through to the real `claude`.
+
+```sh
+claude profile new personal     # create it
+cd ~/side-project && claude     # picker appears; choose personal; /login once
+cd ~/side-project/packages/ui
+claude                          # subdirectories inherit the mapping
+```
+
+For a one-off, without saving anything:
+
+```sh
+CLAUDE_PROFILE=personal claude
+```
+
+## How it works
+
+Claude Code's `CLAUDE_CONFIG_DIR` environment variable relocates everything it stores —
+settings, project history, session transcripts, `.claude.json`, and credentials. Give each
+account its own directory and each gets its own independent login. The wrapper's only job is
+deciding which directory to name.
+
+| Path | Purpose |
+| --- | --- |
+| `claude` | The wrapper. The whole tool. |
+| `install.sh` | Creates the shim symlink and checks `PATH` ordering. |
+| `~/.multi-claude/bin/claude` | The shim: a symlink to the wrapper, first in `PATH`. |
+| `~/.multi-claude/profiles/NAME/` | One `CLAUDE_CONFIG_DIR` per profile, mode `0700`. |
+| `~/.multi-claude/dirmap` | Tab-separated `directory` → `profile` records. |
+
+Resolution stops at the first of these that applies:
+
+1. **`claude profile ...`** — handled by the wrapper; never forwarded.
+2. **`CLAUDECODE` is set** — a nested session. Passed through with the environment untouched,
+   so subagents and background tasks stay on their parent's account.
+3. **`CLAUDE_CONFIG_DIR` is already set** — an explicit choice outranks any mapping. Note that
+   exporting it from your shell startup file disables per-directory switching entirely;
+   `claude profile list` says so when it sees this.
+4. **`CLAUDE_PROFILE` is set** — the one-off override.
+5. **A `dirmap` entry** for the current directory or its nearest mapped ancestor.
+6. **No mapping** — the picker appears if stdin is a terminal, otherwise the `default` profile
+   is used and a note goes to stderr. Pipes, scripts, and CI therefore behave exactly as they
+   did before installing this, and can never block on a prompt.
+
+### Why `default` means "unset"
+
+The `default` profile is your existing `~/.claude`, and selecting it works by *unsetting*
+`CLAUDE_CONFIG_DIR` rather than by setting it to `~/.claude`. Those are not equivalent.
+
+On macOS, Claude Code derives its Keychain entry name from the config directory, appending a
+hash of the path — and it omits that suffix only when `CLAUDE_CONFIG_DIR` is unset. Setting the
+variable to `~/.claude` therefore looks for a *different* Keychain entry, and your existing
+login appears to have vanished. Unsetting it means installing this tool requires no migration
+and no re-login.
+
+This is also what makes profiles genuinely isolated on macOS, where credentials live in the
+Keychain rather than in a file. The wrapper never touches the Keychain itself: deleting a
+profile runs Claude Code's own `auth logout` against that profile.
+
+## Limitations
+
+- **`claude daemon service install` needs the default profile.** Claude Code refuses a
+  non-default config directory there, because the launchd/systemd unit is a per-user
+  singleton.
+- **Profiles share nothing.** Settings, skills, agents, MCP servers, and history do not carry
+  across. A new profile is a clean slate. Copy anything you want by hand.
+- **Per-project trust is per-profile**, since `.claude.json` moves into the profile directory.
+  Expect to re-approve a directory the first time you use it under a new profile.
+- **`claude profile` could collide** if Claude Code ever gains a `profile` subcommand of its
+  own. The fix would be renaming ours.
+- **Linux is untested.** The scripts are POSIX-only and Claude Code documents storing
+  credentials at `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux, so it should work — but it
+  has only been exercised on macOS.
+
+## Uninstall
+
+```sh
+rm -rf ~/.multi-claude          # shim, profiles, and mappings
+```
+
+Then drop the `PATH` line from your shell startup file. `~/.claude` is never touched, so your
+original account is exactly where it was.
+
+Removing `~/.multi-claude` orphans any per-profile credentials macOS holds in the Keychain. To
+avoid that, `claude profile rm NAME` each profile first — that logs out properly.

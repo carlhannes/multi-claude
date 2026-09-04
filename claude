@@ -1,0 +1,375 @@
+#!/bin/sh
+# multi-claude-wrapper — pick a Claude Code account per working directory.
+#
+# Shadows the real `claude` in PATH, resolves a profile from the current
+# working directory, exports CLAUDE_CONFIG_DIR and exec's the real binary.
+# The marker on line 2 is how this script recognises copies of itself in PATH.
+
+set -u
+
+MC_HOME="$HOME/.multi-claude"
+PROFILES_DIR="$MC_HOME/profiles"
+DIRMAP="$MC_HOME/dirmap"
+SELF_MARKER="multi-claude-wrapper"
+TAG="multi-claude"
+
+msg() { printf '%s: %s\n' "$TAG" "$1" >&2; }
+die() { msg "$1"; exit 1; }
+
+# --- locating the real claude ------------------------------------------------
+# Walk PATH and take the first executable `claude` that is not a copy of this
+# script. Identifying ourselves by marker rather than by directory means extra
+# copies of the wrapper anywhere in PATH cannot cause an exec loop.
+find_real_claude() {
+    printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do
+        if [ -z "$d" ] || [ ! -x "$d/claude" ]; then
+            continue
+        fi
+        if head -c 512 "$d/claude" 2>/dev/null | grep -qF -- "$SELF_MARKER"; then
+            continue
+        fi
+        printf '%s\n' "$d/claude"
+        break
+    done
+}
+
+REAL_CLAUDE=$(find_real_claude)
+if [ -z "$REAL_CLAUDE" ]; then
+    die "cannot find the real 'claude' in PATH. Is Claude Code installed?"
+fi
+
+# --- profiles ---------------------------------------------------------------
+# The 'default' profile is the stock ~/.claude, and is selected by *unsetting*
+# CLAUDE_CONFIG_DIR. Setting it to ~/.claude is not equivalent: Claude Code
+# derives the macOS Keychain entry name from the config dir and only omits the
+# hash suffix when the variable is unset, so pointing it at ~/.claude would
+# hide the existing login.
+profile_config_dir() {
+    if [ "$1" = default ]; then
+        printf ''
+    else
+        printf '%s\n' "$PROFILES_DIR/$1"
+    fi
+}
+
+profile_exists() {
+    if [ "$1" = default ]; then
+        return 0
+    fi
+    valid_profile_name "$1" || return 1
+    [ -d "$PROFILES_DIR/$1" ]
+}
+
+valid_profile_name() {
+    case $1 in
+        '' | *[!A-Za-z0-9._-]* | -* | .*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+list_profiles() {
+    printf 'default\n'
+    if [ -d "$PROFILES_DIR" ]; then
+        for p in "$PROFILES_DIR"/*; do
+            [ -d "$p" ] || continue
+            name=${p##*/}
+            if valid_profile_name "$name"; then
+                printf '%s\n' "$name"
+            else
+                msg "ignoring profile directory with unsupported name: $name"
+            fi
+        done
+    fi
+}
+
+# --- directory -> profile mapping -------------------------------------------
+# Stored as "<absolute path><TAB><profile>" lines. awk does the matching
+# because paths may contain regex metacharacters.
+dirmap_without_dir() {
+    if [ -f "$DIRMAP" ]; then awk -F'\t' -v d="$1" '$1 != d' "$DIRMAP"; fi
+}
+
+dirmap_without_profile() {
+    if [ -f "$DIRMAP" ]; then awk -F'\t' -v p="$1" '$2 != p' "$DIRMAP"; fi
+}
+
+# Replaces $DIRMAP with content read from stdin. The temp file is created
+# beside it so the rename is atomic and concurrent shells cannot interleave.
+dirmap_write() {
+    mkdir -p "$MC_HOME" || die "cannot create $MC_HOME"
+    tmp=$(mktemp "$MC_HOME/dirmap.XXXXXX") || die "cannot create a temp file in $MC_HOME"
+    if cat > "$tmp" && mv "$tmp" "$DIRMAP"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    die "cannot update $DIRMAP"
+}
+
+lookup_dirmap() {
+    if [ -f "$DIRMAP" ]; then
+        awk -F'\t' -v d="$1" '$1 == d { print $2; exit }' "$DIRMAP"
+    fi
+}
+
+# Walks up from the current directory so subdirectories inherit the mapping.
+# Sets RESOLVED_PROFILE and RESOLVED_FROM.
+RESOLVED_PROFILE=""
+RESOLVED_FROM=""
+resolve_for_cwd() {
+    RESOLVED_PROFILE=""
+    RESOLVED_FROM=""
+    d=$(pwd -P)
+    while :; do
+        p=$(lookup_dirmap "$d")
+        if [ -n "$p" ]; then
+            RESOLVED_PROFILE=$p
+            RESOLVED_FROM=$d
+            return 0
+        fi
+        [ "$d" = / ] && return 1
+        d=$(dirname -- "$d")
+    done
+}
+
+save_mapping() {
+    { dirmap_without_dir "$1"; printf '%s\t%s\n' "$1" "$2"; } | dirmap_write || exit 1
+}
+
+# --- account labels ---------------------------------------------------------
+json_field() {
+    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# Best-effort: display only. A changed output shape yields blank fields rather
+# than a broken command, and the launch path never calls this.
+describe_profile() {
+    name=$1
+    dir=$(profile_config_dir "$name")
+    json=$(
+        if [ -z "$dir" ]; then
+            unset CLAUDE_CONFIG_DIR
+        else
+            CLAUDE_CONFIG_DIR=$dir
+            export CLAUDE_CONFIG_DIR
+        fi
+        "$REAL_CLAUDE" auth status --json 2>/dev/null
+    )
+    if printf '%s\n' "$json" | grep -q -- '"loggedIn"[[:space:]]*:[[:space:]]*true'; then
+        email=$(printf '%s\n' "$json" | json_field email)
+        org=$(printf '%s\n' "$json" | json_field orgName)
+        plan=$(printf '%s\n' "$json" | json_field subscriptionType)
+        printf '%-14s %s' "$name" "${email:-signed in}"
+        [ -n "$org" ] && printf '  %s' "$org"
+        [ -n "$plan" ] && printf '  (%s)' "$plan"
+        printf '\n'
+    else
+        printf '%-14s %s\n' "$name" "not logged in"
+    fi
+}
+
+# --- commands ---------------------------------------------------------------
+usage() {
+    cat <<'USAGE'
+multi-claude — one Claude Code account per working directory.
+
+  claude profile              pick the profile for this directory
+  claude profile list         show profiles and their accounts
+  claude profile use NAME     map this directory to NAME
+  claude profile unset        drop this directory's mapping
+  claude profile new NAME     create a profile
+  claude profile rm NAME      delete a profile
+
+Anything else is passed straight through to the real claude, with
+CLAUDE_CONFIG_DIR set for the profile mapped to the current directory.
+The 'default' profile is your stock ~/.claude.
+
+  CLAUDE_PROFILE=NAME claude  use NAME once, without saving a mapping
+USAGE
+}
+
+cmd_list() {
+    if [ -n "${CLAUDE_CONFIG_DIR-}" ]; then
+        msg "CLAUDE_CONFIG_DIR is set in your environment, so it overrides all mappings."
+    fi
+    active=""
+    dangling=""
+    if resolve_for_cwd; then
+        if profile_exists "$RESOLVED_PROFILE"; then
+            active=$RESOLVED_PROFILE
+        else
+            dangling=$RESOLVED_PROFILE
+        fi
+    fi
+    for p in $(list_profiles); do
+        if [ "$p" = "$active" ]; then printf '* '; else printf '  '; fi
+        describe_profile "$p"
+    done
+    if [ -n "$active" ]; then
+        printf '\nActive here via %s\n' "$RESOLVED_FROM"
+    elif [ -n "$dangling" ]; then
+        printf '\n%s is mapped to %s, which no longer exists — falls back to default\n' "$RESOLVED_FROM" "$dangling"
+    else
+        printf '\nNo mapping for %s — falls back to default\n' "$(pwd -P)"
+    fi
+}
+
+cmd_new() {
+    name=${1:-}
+    valid_profile_name "$name" || die "invalid profile name: '${name}' (use letters, digits, dot, dash, underscore)"
+    if [ "$name" = default ]; then
+        die "'default' is reserved for your existing ~/.claude"
+    fi
+    if [ -d "$PROFILES_DIR/$name" ]; then
+        die "profile '$name' already exists"
+    fi
+    mkdir -p "$PROFILES_DIR/$name" || die "cannot create $PROFILES_DIR/$name"
+    chmod 700 "$MC_HOME" "$PROFILES_DIR" "$PROFILES_DIR/$name" 2>/dev/null || true
+    msg "created profile '$name' at $PROFILES_DIR/$name"
+    msg "it is empty — Claude Code will run onboarding and ask you to log in on first use"
+}
+
+cmd_use() {
+    name=${1:-}
+    [ -n "$name" ] || die "usage: claude profile use NAME"
+    valid_profile_name "$name" || die "invalid profile name: '$name'"
+    profile_exists "$name" || die "no such profile: '$name' (create it with: claude profile new $name)"
+    here=$(pwd -P)
+    save_mapping "$here" "$name"
+    msg "$here -> $name"
+}
+
+cmd_unset() {
+    here=$(pwd -P)
+    if [ -n "$(lookup_dirmap "$here")" ]; then
+        dirmap_without_dir "$here" | dirmap_write || exit 1
+        msg "removed the mapping for $here"
+    else
+        msg "no mapping set for $here"
+    fi
+}
+
+cmd_rm() {
+    name=${1:-}
+    [ -n "$name" ] || die "usage: claude profile rm NAME"
+    if [ "$name" = default ]; then
+        die "refusing to delete 'default' — that is your ~/.claude"
+    fi
+    valid_profile_name "$name" || die "invalid profile name: '$name'"
+    dir="$PROFILES_DIR/$name"
+    [ -d "$dir" ] || die "no such profile: '$name'"
+    [ -t 0 ] || die "refusing to delete '$name' without an interactive confirmation"
+
+    printf '%s: delete profile "%s" and everything in %s? [y/N] ' "$TAG" "$name" "$dir" >&2
+    IFS= read -r reply || reply=""
+    case $reply in
+        y | Y | yes | YES) ;;
+        *) msg "cancelled"; exit 0 ;;
+    esac
+
+    # Log out through Claude Code itself rather than touching the Keychain, and
+    # call the real binary directly so this cannot re-resolve to another profile.
+    if ! CLAUDE_CONFIG_DIR="$dir" "$REAL_CLAUDE" auth logout >/dev/null 2>&1; then
+        msg "could not log out of '$name'; a stale credential may remain in your keychain"
+    fi
+    rm -rf "$dir" || die "cannot remove $dir"
+    dirmap_without_profile "$name" | dirmap_write || exit 1
+    msg "deleted profile '$name'"
+}
+
+# Presents the menu on stderr and sets PICKED, leaving stdout clean.
+PICKED=""
+cmd_pick() {
+    PICKED=""
+    [ -t 0 ] || die "cannot show the picker: stdin is not a terminal"
+    here=$(pwd -P)
+    set -- $(list_profiles)
+
+    printf '%s: which account should %s use?\n' "$TAG" "$here" >&2
+    i=0
+    for p in "$@"; do
+        i=$((i + 1))
+        printf '  %d) %s\n' "$i" "$(describe_profile "$p")" >&2
+    done
+    printf '  n) create a new profile\n' >&2
+    printf 'Choice: ' >&2
+    IFS= read -r ans || die "no selection"
+
+    if [ "$ans" = n ] || [ "$ans" = N ]; then
+        printf 'New profile name: ' >&2
+        IFS= read -r newname || die "no name given"
+        cmd_new "$newname"
+        PICKED=$newname
+    else
+        j=0
+        for p in "$@"; do
+            j=$((j + 1))
+            if [ "$j" = "$ans" ]; then
+                PICKED=$p
+            fi
+        done
+        [ -n "$PICKED" ] || die "invalid choice: '$ans'"
+    fi
+
+    save_mapping "$here" "$PICKED"
+    msg "$here -> $PICKED"
+}
+
+# --- dispatch ---------------------------------------------------------------
+# Management runs before the passthrough guards below: inside a Claude Code
+# session CLAUDECODE is set, and forwarding `profile` to the real binary would
+# fail because it has no such subcommand.
+if [ "${1-}" = profile ]; then
+    shift
+    sub=${1-}
+    [ $# -gt 0 ] && shift
+    case $sub in
+        '')            cmd_pick ;;
+        list | ls)     cmd_list ;;
+        use)           cmd_use "${1-}" ;;
+        unset)         cmd_unset ;;
+        new | create)  cmd_new "${1-}" ;;
+        rm | remove | delete) cmd_rm "${1-}" ;;
+        help | -h | --help) usage ;;
+        *)             usage; die "unknown subcommand: $sub" ;;
+    esac
+    exit 0
+fi
+
+# Nested session, or an explicit override already in the environment: leave the
+# environment exactly as it is.
+if [ -n "${CLAUDECODE-}" ] || [ -n "${CLAUDE_CONFIG_DIR-}" ]; then
+    exec "$REAL_CLAUDE" "$@"
+fi
+
+# One-off override.
+if [ -n "${CLAUDE_PROFILE-}" ]; then
+    profile=$CLAUDE_PROFILE
+    profile_exists "$profile" || die "CLAUDE_PROFILE names a profile that does not exist: '$profile'"
+else
+    profile=default
+    if resolve_for_cwd; then
+        if profile_exists "$RESOLVED_PROFILE"; then
+            profile=$RESOLVED_PROFILE
+        else
+            msg "$RESOLVED_FROM is mapped to '$RESOLVED_PROFILE', which no longer exists"
+            RESOLVED_PROFILE=""
+        fi
+    fi
+    if [ -z "$RESOLVED_PROFILE" ]; then
+        if [ -t 0 ]; then
+            cmd_pick
+            profile=$PICKED
+        else
+            msg "no profile mapped for $(pwd -P) — using default"
+        fi
+    fi
+fi
+
+dir=$(profile_config_dir "$profile")
+if [ -z "$dir" ]; then
+    unset CLAUDE_CONFIG_DIR
+else
+    CLAUDE_CONFIG_DIR=$dir
+    export CLAUDE_CONFIG_DIR
+fi
+exec "$REAL_CLAUDE" "$@"
