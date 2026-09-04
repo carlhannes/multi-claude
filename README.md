@@ -28,17 +28,31 @@ cd ~/src/multi-claude
 
 The installer symlinks the wrapper into `~/.multi-claude/bin/` and prints the one `PATH` line
 to add to your shell startup file. It edits none of your files, and it never touches
-`~/.local/bin/claude` — that symlink belongs to `claude update`.
+`~/.local/bin/claude` — that symlink belongs to `claude update`. Because the shim is a symlink
+into the clone, `git pull` updates the tool in place.
 
-The `PATH` line must come *after* anything that adds the real `claude` to your `PATH`, or the
-wrapper is shadowed instead of shadowing. Re-run `./install.sh` at any time to check; it
-reports which of the two wins. Confirm with:
+### Try it in one shell first
+
+You do not have to edit your shell config to evaluate this. One `export` in a throwaway shell
+is a complete trial, and closing the shell reverts it:
 
 ```sh
-command -v claude   # should print ~/.multi-claude/bin/claude
+export PATH="$HOME/.multi-claude/bin:$PATH"
+command -v claude    # should print ~/.multi-claude/bin/claude
 ```
 
-Because the shim is a symlink into the clone, `git pull` updates the tool in place.
+Every `claude` in that shell now goes through the wrapper. Nothing persists except profiles you
+explicitly create, and `claude profile rm NAME` removes those.
+
+**Test from a plain terminal, not from inside a Claude Code session.** A nested session sets
+`CLAUDECODE`, which trips the nested-session passthrough described below, so the wrapper
+deliberately does nothing — which looks exactly like a broken install.
+
+### Make it permanent
+
+Add the same line to your shell startup file. It must come *after* anything that adds the real
+`claude` to your `PATH`, or the wrapper is shadowed instead of shadowing. Re-run `./install.sh`
+at any time to check; it reports which of the two currently wins.
 
 ## Usage
 
@@ -77,6 +91,7 @@ deciding which directory to name.
 | --- | --- |
 | `claude` | The wrapper. The whole tool. |
 | `install.sh` | Creates the shim symlink and checks `PATH` ordering. |
+| `test.sh` | Behavioural tests. Hermetic — see [Tests](#tests). |
 | `~/.multi-claude/bin/claude` | The shim: a symlink to the wrapper, first in `PATH`. |
 | `~/.multi-claude/profiles/NAME/` | One `CLAUDE_CONFIG_DIR` per profile, mode `0700`. |
 | `~/.multi-claude/dirmap` | Tab-separated `directory` → `profile` records. |
@@ -109,6 +124,16 @@ and no re-login.
 This is also what makes profiles genuinely isolated on macOS, where credentials live in the
 Keychain rather than in a file. The wrapper never touches the Keychain itself: deleting a
 profile runs Claude Code's own `auth logout` against that profile.
+
+## Tests
+
+```sh
+./test.sh                # or: ./test.sh /bin/dash
+```
+
+Every check runs the wrapper with `HOME` pointed at a temp directory and a stub `claude` first
+on `PATH`, so the suite never reads or writes a real profile, credential, or binary. It is safe
+to run at any time and cleans up after itself.
 
 ## Limitations
 
