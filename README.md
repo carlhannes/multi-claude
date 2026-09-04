@@ -125,6 +125,21 @@ This is also what makes profiles genuinely isolated on macOS, where credentials 
 Keychain rather than in a file. The wrapper never touches the Keychain itself: deleting a
 profile runs Claude Code's own `auth logout` against that profile.
 
+## Developing
+
+To run the wrapper straight from a clone without installing anything, put the repo itself on
+`PATH` — the repo root holds the executable `claude`, so that is all it takes, and your edits
+are live immediately:
+
+```sh
+export PATH="$PWD:$PATH"
+```
+
+Run that from the repo root. `$PWD` expands at that moment, so it keeps working after you `cd`
+away; confirm with `command -v claude`. Avoid `.:$PATH`, which would let any directory you
+visit supply its own `claude`. Note this acts on your real profiles in `~/.multi-claude`, so
+use the tests below for anything you would rather not do to real state.
+
 ## Tests
 
 ```sh
