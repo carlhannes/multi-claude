@@ -10,6 +10,7 @@ set -u
 MC_HOME="$HOME/.multi-claude"
 PROFILES_DIR="$MC_HOME/profiles"
 DIRMAP="$MC_HOME/dirmap"
+DEFAULT_REMOVED="$MC_HOME/default-removed"
 SELF_MARKER="multi-claude-wrapper"
 TAG="multi-claude"
 
@@ -54,7 +55,8 @@ profile_config_dir() {
 
 profile_exists() {
     if [ "$1" = default ]; then
-        return 0
+        [ ! -f "$DEFAULT_REMOVED" ]
+        return
     fi
     valid_profile_name "$1" || return 1
     [ -d "$PROFILES_DIR/$1" ]
@@ -68,7 +70,7 @@ valid_profile_name() {
 }
 
 list_profiles() {
-    printf 'default\n'
+    profile_exists default && printf 'default\n'
     if [ -d "$PROFILES_DIR" ]; then
         for p in "$PROFILES_DIR"/*; do
             [ -d "$p" ] || continue
@@ -80,6 +82,31 @@ list_profiles() {
             fi
         done
     fi
+}
+
+# --- shared session history ---------------------------------------------------
+# Transcripts (what `claude --resume` lists) and /rewind checkpoints live under
+# these directories in the config dir. Every profile's copy is a symlink to the
+# default profile's, so session history is one pool for the machine while the
+# login, settings and .claude.json stay per profile. Claude Code builds these
+# paths with a plain join and applies its symlink checks to the files inside,
+# so a linked directory is transparent to it (checked against 2.1.283).
+SHARED_DIRS="projects file-history"
+
+link_shared_dirs() { # profile dir
+    for s in $SHARED_DIRS; do
+        target="$HOME/.claude/$s"
+        link="$1/$s"
+        mkdir -p "$target" || { msg "cannot create $target"; continue; }
+        [ -L "$link" ] && continue
+        if [ -e "$link" ]; then
+            # A real directory from before history was shared. Only an empty one
+            # is replaced; anything else needs the migration steps in the README.
+            rmdir "$link" 2>/dev/null \
+                || { msg "$link is a real directory — history for this profile is not shared yet (README: 'Sharing history from an older profile')"; continue; }
+        fi
+        ln -s "$target" "$link" || msg "cannot link $link -> $target"
+    done
 }
 
 # --- directory -> profile mapping -------------------------------------------
@@ -135,6 +162,17 @@ save_mapping() {
     { dirmap_without_dir "$1"; printf '%s\t%s\n' "$1" "$2"; } | dirmap_write || exit 1
 }
 
+# Prints every mapping, sorted, for `claude profile list`.
+list_mappings() {
+    [ -s "$DIRMAP" ] || { printf '  (none)\n'; return; }
+    LC_ALL=C sort "$DIRMAP" | while IFS=$(printf '\t') read -r d p; do
+        note=""
+        [ -d "$d" ] || note="  (directory missing)"
+        profile_exists "$p" || note="$note  (profile missing)"
+        printf '  %s -> %s%s\n' "$d" "$p" "$note"
+    done
+}
+
 # --- account labels ---------------------------------------------------------
 json_field() {
     sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
@@ -173,7 +211,7 @@ usage() {
 multi-claude — one Claude Code account per working directory.
 
   claude profile              pick the profile for this directory
-  claude profile list         show profiles and their accounts
+  claude profile list         show profiles, accounts and directory mappings
   claude profile use NAME     map this directory to NAME
   claude profile unset        drop this directory's mapping
   claude profile new NAME     create a profile
@@ -200,16 +238,24 @@ cmd_list() {
             dangling=$RESOLVED_PROFILE
         fi
     fi
+    printf 'Profiles:\n'
     for p in $(list_profiles); do
         if [ "$p" = "$active" ]; then printf '* '; else printf '  '; fi
         describe_profile "$p"
     done
+    printf '\nDirectories:\n'
+    list_mappings
+    if profile_exists default; then
+        fallback="falls back to default"
+    else
+        fallback="the picker will ask; non-interactive runs fail"
+    fi
     if [ -n "$active" ]; then
         printf '\nActive here via %s\n' "$RESOLVED_FROM"
     elif [ -n "$dangling" ]; then
-        printf '\n%s is mapped to %s, which no longer exists — falls back to default\n' "$RESOLVED_FROM" "$dangling"
+        printf '\n%s is mapped to %s, which no longer exists — %s\n' "$RESOLVED_FROM" "$dangling" "$fallback"
     else
-        printf '\nNo mapping for %s — falls back to default\n' "$(pwd -P)"
+        printf '\nNo mapping for %s — %s\n' "$(pwd -P)" "$fallback"
     fi
 }
 
@@ -217,6 +263,9 @@ cmd_new() {
     name=${1:-}
     valid_profile_name "$name" || die "invalid profile name: '${name}' (use letters, digits, dot, dash, underscore)"
     if [ "$name" = default ]; then
+        if [ -f "$DEFAULT_REMOVED" ]; then
+            die "'default' is your ~/.claude, which was deleted; to restore it: rm $DEFAULT_REMOVED"
+        fi
         die "'default' is reserved for your existing ~/.claude"
     fi
     if [ -d "$PROFILES_DIR/$name" ]; then
@@ -224,6 +273,7 @@ cmd_new() {
     fi
     mkdir -p "$PROFILES_DIR/$name" || die "cannot create $PROFILES_DIR/$name"
     chmod 700 "$MC_HOME" "$PROFILES_DIR" "$PROFILES_DIR/$name" 2>/dev/null || true
+    link_shared_dirs "$PROFILES_DIR/$name"
     msg "created profile '$name' at $PROFILES_DIR/$name"
     msg "it is empty — Claude Code will run onboarding and ask you to log in on first use"
 }
@@ -251,15 +301,21 @@ cmd_unset() {
 cmd_rm() {
     name=${1:-}
     [ -n "$name" ] || die "usage: claude profile rm NAME"
-    if [ "$name" = default ]; then
-        die "refusing to delete 'default' — that is your ~/.claude"
-    fi
     valid_profile_name "$name" || die "invalid profile name: '$name'"
-    dir="$PROFILES_DIR/$name"
-    [ -d "$dir" ] || die "no such profile: '$name'"
+    profile_exists "$name" || die "no such profile: '$name'"
+    dir=$(profile_config_dir "$name")
+    if [ "$name" = default ] && [ "$(list_profiles | wc -l)" -le 1 ]; then
+        die "cannot delete 'default' when it is the only profile"
+    fi
     [ -t 0 ] || die "refusing to delete '$name' without an interactive confirmation"
 
-    printf '%s: delete profile "%s" and everything in %s? [y/N] ' "$TAG" "$name" "$dir" >&2
+    if [ "$name" = default ]; then
+        # ~/.claude stays: it hosts the shared history and Claude Code recreates it anyway.
+        printf '%s: delete profile "default" — log out of ~/.claude and stop offering it? Shared session history is kept.\n' "$TAG" >&2
+        printf '%s: after this, directories without a mapping ask which profile to use, and non-interactive runs there fail until mapped. [y/N] ' "$TAG" >&2
+    else
+        printf '%s: delete profile "%s" — its login and settings in %s? Shared session history is kept. [y/N] ' "$TAG" "$name" "$dir" >&2
+    fi
     IFS= read -r reply || reply=""
     case $reply in
         y | Y | yes | YES) ;;
@@ -268,12 +324,24 @@ cmd_rm() {
 
     # Log out through Claude Code itself rather than touching the Keychain, and
     # call the real binary directly so this cannot re-resolve to another profile.
-    if ! CLAUDE_CONFIG_DIR="$dir" "$REAL_CLAUDE" auth logout >/dev/null 2>&1; then
+    # For default the variable must be unset, not set to ~/.claude (see above).
+    if ! (
+        if [ -z "$dir" ]; then unset CLAUDE_CONFIG_DIR; else CLAUDE_CONFIG_DIR=$dir; export CLAUDE_CONFIG_DIR; fi
+        "$REAL_CLAUDE" auth logout >/dev/null 2>&1
+    ); then
         msg "could not log out of '$name'; a stale credential may remain in your keychain"
     fi
-    rm -rf "$dir" || die "cannot remove $dir"
+    if [ -z "$dir" ]; then
+        mkdir -p "$MC_HOME" || die "cannot create $MC_HOME"
+        printf 'Created by "claude profile rm default". Delete this file to offer the ~/.claude profile again.\n' > "$DEFAULT_REMOVED" \
+            || die "cannot write $DEFAULT_REMOVED"
+    else
+        rm -rf "$dir" || die "cannot remove $dir"
+    fi
     dirmap_without_profile "$name" | dirmap_write || exit 1
     msg "deleted profile '$name'"
+    [ -z "$dir" ] && msg "~/.claude is kept — it holds the session history every profile shares"
+    return 0
 }
 
 # Presents the menu on stderr and sets PICKED, leaving stdout clean.
@@ -359,8 +427,10 @@ else
         if [ -t 0 ]; then
             cmd_pick
             profile=$PICKED
-        else
+        elif profile_exists default; then
             msg "no profile mapped for $(pwd -P) — using default"
+        else
+            die "no profile mapped for $(pwd -P) — run 'claude profile use NAME' there, or set CLAUDE_PROFILE"
         fi
     fi
 fi
@@ -371,5 +441,6 @@ if [ -z "$dir" ]; then
 else
     CLAUDE_CONFIG_DIR=$dir
     export CLAUDE_CONFIG_DIR
+    link_shared_dirs "$dir"
 fi
 exec "$REAL_CLAUDE" "$@"

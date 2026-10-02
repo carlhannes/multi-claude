@@ -20,10 +20,13 @@ TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 mkdir -p "$TMP/stub" "$TMP/home" "$TMP/proj/deep/nested" "$TMP/elsewhere"
+# The stub also logs every call, because `rm` discards the output of its logout.
 cat > "$TMP/stub/claude" <<'STUB'
 #!/bin/sh
-printf 'STUB config_dir=[%s] args=[%s]\n' "${CLAUDE_CONFIG_DIR-<UNSET>}" "$*"
+line=$(printf 'STUB config_dir=[%s] args=[%s]' "${CLAUDE_CONFIG_DIR-<UNSET>}" "$*")
+printf '%s\n' "$line" | tee -a "__LOG__"
 STUB
+sed "s|__LOG__|$TMP/calls.log|" "$TMP/stub/claude" > "$TMP/stub/claude.tmp" && mv "$TMP/stub/claude.tmp" "$TMP/stub/claude"
 chmod +x "$TMP/stub/claude"
 
 # The picker sits behind `[ -t 0 ]` and macOS `script` mangles piped stdin, so
@@ -56,6 +59,16 @@ check_eq() { # description, expected, actual
     fi
 }
 
+check_absent() { # description, forbidden substring, actual
+    if printf '%s' "$3" | grep -qF -- "$2"; then
+        fail=$((fail + 1))
+        printf '  FAIL %s\n         unwanted substring: %s\n         got:                %s\n' "$1" "$2" "$3"
+    else
+        pass=$((pass + 1))
+        printf '  ok   %s\n' "$1"
+    fi
+}
+
 # Run the wrapper in DIR with a clean environment.
 mc() {
     _dir=$1
@@ -85,7 +98,7 @@ mc_pick() {
     )
 }
 
-reset_state() { rm -rf "$TMP/home/.multi-claude"; }
+reset_state() { rm -rf "$TMP/home/.multi-claude" "$TMP/home/.claude" "$TMP/calls.log"; }
 
 dirmap_lines() {
     if [ -f "$TMP/home/.multi-claude/dirmap" ]; then
@@ -193,8 +206,8 @@ out=$(
 )
 check "CLAUDE_PROFILE rejects a traversal name" "does not exist" "$out"
 
-out=$(mc "$TMP/proj" profile rm default </dev/null)
-check "rm refuses the default profile" "refusing to delete" "$out"
+out=$(mc "$TMP/elsewhere" profile rm default </dev/null)
+check "rm default refuses without a tty" "interactive confirmation" "$out"
 
 out=$(mc "$TMP/proj" profile rm work </dev/null)
 check "rm refuses without a tty" "interactive confirmation" "$out"
@@ -217,6 +230,7 @@ reset_state
 mc "$TMP/proj" profile new work >/dev/null 2>&1
 mc "$TMP/proj" profile use work >/dev/null 2>&1
 rm -rf "$TMP/home/.multi-claude/profiles/work"
+check_eq "removing a profile tree leaves the shared history" "yes" "$(test -d "$TMP/home/.claude/projects" && echo yes || echo GONE)"
 
 out=$(mc "$TMP/proj" --version)
 check "dangling mapping warns"                "no longer exists"     "$out"
@@ -282,6 +296,125 @@ fresh
 ' profile)
 check "'n' creates and selects a new profile" "-> fresh" "$out"
 check_eq "the new profile exists" "yes" "$(test -d "$TMP/home/.multi-claude/profiles/fresh" && echo yes || echo no)"
+
+# --- shared session history -------------------------------------------------
+# projects/ and file-history/ inside a profile are symlinks into the fake ~/.claude.
+printf '\nshared session history\n'
+reset_state
+mc "$TMP/proj" profile new work >/dev/null 2>&1
+mc "$TMP/proj" profile use work >/dev/null 2>&1
+W="$TMP/home/.multi-claude/profiles/work"
+SHARED="$TMP/home/.claude"
+
+check_eq "new links projects into ~/.claude"     "$SHARED/projects"     "$(readlink "$W/projects")"
+check_eq "new links file-history into ~/.claude" "$SHARED/file-history" "$(readlink "$W/file-history")"
+
+rm "$W/projects"
+mc "$TMP/proj" --version >/dev/null 2>&1
+check_eq "a missing link is recreated on launch" "$SHARED/projects" "$(readlink "$W/projects")"
+
+# An empty real directory (Claude Code may create one) is swapped for the link.
+rm "$W/projects"
+mkdir "$W/projects"
+mc "$TMP/proj" --version >/dev/null 2>&1
+check_eq "an empty real dir is replaced by the link" "$SHARED/projects" "$(readlink "$W/projects")"
+
+# A populated real directory is a pre-sharing profile: report it, touch nothing.
+rm "$W/projects"
+mkdir -p "$W/projects/slug"
+: > "$W/projects/slug/old.jsonl"
+out=$(mc "$TMP/proj" --version)
+check "a populated real dir is reported"  "not shared yet" "$out"
+check "and the launch still goes through" "STUB"           "$out"
+check_eq "and its contents are untouched" "yes" "$(test -f "$W/projects/slug/old.jsonl" && test ! -L "$W/projects" && echo yes || echo no)"
+rm -rf "$W/projects"
+
+# Deleting a profile unlinks; it must never descend into the shared history.
+mkdir -p "$SHARED/projects/x"
+: > "$SHARED/projects/x/precious.jsonl"
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm work)
+check "rm deletes the profile" "deleted profile" "$out"
+check_eq "shared transcripts survive rm" "yes" "$(test -f "$SHARED/projects/x/precious.jsonl" && echo yes || echo GONE)"
+
+# default *is* ~/.claude and must never be linked to itself.
+out=$(mc "$TMP/elsewhere" --version)
+check_eq "default never links ~/.claude to itself" "yes" "$(test ! -L "$SHARED/projects" && echo yes || echo no)"
+
+# --- directory listing ------------------------------------------------------
+printf '\ndirectory listing\n'
+reset_state
+mc "$TMP/proj" profile new work >/dev/null 2>&1
+mc "$TMP/proj" profile use work >/dev/null 2>&1
+mc "$TMP/elsewhere" profile use default >/dev/null 2>&1
+printf '/no/such/dir\twork\n' >> "$TMP/home/.multi-claude/dirmap"
+
+out=$(mc "$TMP/proj" profile list)
+check "list has a Directories block"   "Directories:"        "$out"
+check "list shows a mapping"           "/proj -> work"       "$out"
+check "list marks a missing directory" "(directory missing)" "$out"
+first=$(printf '%s\n' "$out" | grep -F -- ' -> ' | head -n 1)
+check "mappings come out sorted"       "/no/such/dir"        "$first"
+
+rm -rf "$W"
+out=$(mc "$TMP/proj" profile list)
+check "list marks a missing profile"   "(profile missing)"   "$out"
+
+# --- deleting default -------------------------------------------------------
+printf '\ndeleting default\n'
+reset_state
+mc "$TMP/proj" profile use default >/dev/null 2>&1
+MARKER="$TMP/home/.multi-claude/default-removed"
+
+# `rm default` ran above with no other profile; the "only profile" check there
+# proves the refusal. With a tty it must still refuse before touching anything.
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm default)
+check "alone, rm default errors even past the tty gate" "only profile" "$out"
+check_eq "and writes no marker" "no" "$(test -f "$MARKER" && echo yes || echo no)"
+check_absent "and never logs out" "auth logout" "$(cat "$TMP/calls.log" 2>/dev/null)"
+
+mc "$TMP/proj" profile new work >/dev/null 2>&1
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm default)
+check "with another profile, rm default succeeds" "deleted profile 'default'" "$out"
+check "and says ~/.claude is kept" "is kept" "$out"
+check_eq "the marker exists" "yes" "$(test -f "$MARKER" && echo yes || echo no)"
+check "logout ran with CLAUDE_CONFIG_DIR unset" "config_dir=[<UNSET>] args=[auth logout]" "$(cat "$TMP/calls.log")"
+check_eq "its mapping is gone" "0" "$(dirmap_lines)"
+
+out=$(mc "$TMP/proj" profile list)
+check_absent "list no longer offers default" "  default" "$out"
+out=$(mc_pick "$TMP/proj" '1
+' profile)
+check "the picker's first entry is now the other profile" "-> work" "$out"
+
+out=$(
+    cd "$TMP/elsewhere" || exit 1
+    unset CLAUDECODE CLAUDE_CONFIG_DIR
+    HOME="$TMP/home"; PATH="$TMP/stub:/usr/bin:/bin"; CLAUDE_PROFILE=default
+    export HOME PATH CLAUDE_PROFILE
+    "$SH" "$WRAPPER" --version 2>&1
+)
+check "CLAUDE_PROFILE=default is rejected" "does not exist" "$out"
+
+out=$(mc "$TMP/elsewhere" --version </dev/null)
+check "unmapped non-interactive run fails with the fix" "set CLAUDE_PROFILE" "$out"
+check_absent "and does not reach claude" "STUB" "$out"
+
+out=$(mc "$TMP/proj" profile new default)
+check "new default names the way back" "default-removed" "$out"
+out=$(mc "$TMP/elsewhere" profile list)
+check "list says the picker will ask, not 'falls back'" "the picker will ask" "$out"
+check_absent "and no longer claims a default fallback" "falls back to default" "$out"
+
+
+# A directory profile's rm logs out of that directory, not of ~/.claude.
+rm -f "$TMP/calls.log"
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm work)
+check "rm of a directory profile logs out of its dir" "profiles/work] args=[auth logout]" "$(cat "$TMP/calls.log")"
+check_absent "with no default warning" "non-interactive runs" "$out"
 
 # --- result -----------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

@@ -58,7 +58,7 @@ at any time to check; it reports which of the two currently wins.
 
 ```
 claude profile              pick the profile for this directory
-claude profile list         show profiles and their accounts
+claude profile list         show profiles, accounts and directory mappings
 claude profile use NAME     map this directory to NAME
 claude profile unset        drop this directory's mapping
 claude profile new NAME     create a profile
@@ -83,9 +83,9 @@ CLAUDE_PROFILE=personal claude
 ## How it works
 
 Claude Code's `CLAUDE_CONFIG_DIR` environment variable relocates everything it stores —
-settings, project history, session transcripts, `.claude.json`, and credentials. Give each
-account its own directory and each gets its own independent login. The wrapper's only job is
-deciding which directory to name.
+settings, `.claude.json`, credentials, and session transcripts. Give each account its own
+directory and each gets its own independent login. The wrapper's job is deciding which
+directory to name — and then linking the session history back together, below.
 
 | Path | Purpose |
 | --- | --- |
@@ -93,8 +93,11 @@ deciding which directory to name.
 | `install.sh` | Creates the shim symlink and checks `PATH` ordering. |
 | `test.sh` | Behavioural tests. Hermetic — see [Tests](#tests). |
 | `~/.multi-claude/bin/claude` | The shim: a symlink to the wrapper, first in `PATH`. |
-| `~/.multi-claude/profiles/NAME/` | One `CLAUDE_CONFIG_DIR` per profile, mode `0700`. |
+| `~/.multi-claude/profiles/NAME/` | One `CLAUDE_CONFIG_DIR` per profile, mode `0700`, with `projects/` and `file-history/` linked into `~/.claude`. |
+| `~/.claude/projects/` | Session transcripts and per-directory memory. Shared by every profile. |
+| `~/.claude/file-history/` | `/rewind` checkpoints. Shared by every profile. |
 | `~/.multi-claude/dirmap` | Tab-separated `directory` → `profile` records. |
+| `~/.multi-claude/default-removed` | Marker: the `~/.claude` profile was deleted. Remove it to restore. |
 
 Resolution stops at the first of these that applies:
 
@@ -106,9 +109,10 @@ Resolution stops at the first of these that applies:
    `claude profile list` says so when it sees this.
 4. **`CLAUDE_PROFILE` is set** — the one-off override.
 5. **A `dirmap` entry** for the current directory or its nearest mapped ancestor.
-6. **No mapping** — the picker appears if stdin is a terminal, otherwise the `default` profile
-   is used and a note goes to stderr. Pipes, scripts, and CI therefore behave exactly as they
-   did before installing this, and can never block on a prompt.
+6. **No mapping** — the picker appears if stdin is a terminal. Otherwise the `default` profile
+   is used and a note goes to stderr, so pipes, scripts, and CI behave exactly as they did
+   before installing this and can never block on a prompt. If `default` has been deleted, a
+   non-interactive run exits with an error naming the fix instead of guessing an account.
 
 ### Why `default` means "unset"
 
@@ -124,6 +128,62 @@ and no re-login.
 This is also what makes profiles genuinely isolated on macOS, where credentials live in the
 Keychain rather than in a file. The wrapper never touches the Keychain itself: deleting a
 profile runs Claude Code's own `auth logout` against that profile.
+
+### Deleting `default`
+
+Once another profile exists, `claude profile rm default` works like deleting any profile: it
+logs `~/.claude` out, drops its directory mappings so those folders ask again, and stops
+offering it. What differs is what stays: `~/.claude` itself, because it holds the session
+history every profile shares, and its `settings.json` and `~/.claude.json`, which become inert.
+A marker file, `~/.multi-claude/default-removed`, records the deletion; delete the marker to
+offer `~/.claude` again, or log into a new named profile instead.
+
+There is deliberately no replacement fallback. A mapping always names a concrete profile, so
+nothing can change which account a folder uses behind your back.
+
+### Session history is shared
+
+Two directories inside a profile are symlinks into `~/.claude` rather than real directories:
+`projects/`, which holds the session transcripts that `claude --resume` lists (and the
+per-directory memory Claude Code keeps beside them), and `file-history/`, which holds the
+`/rewind` checkpoints. The wrapper creates the links when a profile is made and re-creates
+them on launch if they go missing, so every profile sees one pool of sessions for the machine
+and `--resume` shows a conversation no matter which account recorded it.
+
+Everything else stays per profile: the login, `.claude.json` (account identity and per-project
+trust), `settings.json`, plugins, skills, and `history.jsonl` — the arrow-up prompt recall,
+which Claude Code refuses to read through a symlink, so it cannot join the shared set.
+
+Claude Code builds these paths with a plain join and applies its symlink checks to the files
+inside, so a linked directory is transparent to it. That was verified by reading the binary
+(2.1.283), not from documentation — see [Limitations](#limitations).
+
+### Sharing history from an older profile
+
+A profile created before history was shared has a real `projects/` directory with its own
+transcripts. The wrapper leaves such a directory alone and says so on every launch, because
+merging is a judgment call: session ids are unique, so transcripts never collide, but two
+profiles may both hold a `memory/` for the same folder. Move everything across, then merge any
+leftover `memory/` by hand:
+
+```sh
+P=~/.multi-claude/profiles/NAME
+S=~/.claude/projects
+for d in "$P"/projects/*/; do
+    slug=$(basename "$d")
+    mkdir -p "$S/$slug"
+    for x in "$d"*; do
+        # both profiles remember this folder: merge memory/ by hand
+        [ "$(basename "$x")" = memory ] && [ -e "$S/$slug/memory" ] && continue
+        mv "$x" "$S/$slug/"
+    done
+done
+find "$P/projects" -type f          # anything printed needs a by-hand merge into $S
+mkdir -p ~/.claude/file-history && mv "$P"/file-history/* ~/.claude/file-history/
+rm -rf "$P/projects" "$P/file-history"   # once nothing you care about remains
+```
+
+The next `claude` in a directory mapped to that profile links both directories.
 
 ## Developing
 
@@ -155,12 +215,22 @@ to run at any time and cleans up after itself.
 - **`claude daemon service install` needs the default profile.** Claude Code refuses a
   non-default config directory there, because the launchd/systemd unit is a per-user
   singleton.
-- **Profiles share nothing.** Settings, skills, agents, MCP servers, and history do not carry
-  across. A new profile is a clean slate. Copy anything you want by hand.
+- **Profiles share session history and nothing else.** Settings, skills, agents, MCP servers,
+  and prompt recall do not carry across; a new profile is otherwise a clean slate. Per-directory
+  memory lives inside `projects/`, so it is shared too — what Claude remembers about a folder
+  does not depend on which account is billed.
+- **A linked `projects/` is not a documented Claude Code configuration.** It works because the
+  binary joins the path and only refuses symlinks at the file level (verified on 2.1.283). If a
+  future update stops following it, remove the link from that profile and it falls back to
+  isolated history; nothing is lost either way.
+- **History cleanup is shared.** Claude Code's transcript retention (`cleanupPeriodDays`) and
+  its history purge act on the shared pool whichever profile runs them.
 - **Per-project trust is per-profile**, since `.claude.json` moves into the profile directory.
   Expect to re-approve a directory the first time you use it under a new profile.
 - **`claude profile` could collide** if Claude Code ever gains a `profile` subcommand of its
   own. The fix would be renaming ours.
+- **Bypassing the wrapper re-creates a `default` login.** With `default` deleted, running
+  `~/.local/bin/claude` directly still uses `~/.claude` and will offer to log in there.
 - **Linux is untested.** The scripts are POSIX-only and Claude Code documents storing
   credentials at `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux, so it should work — but it
   has only been exercised on macOS.
@@ -171,8 +241,9 @@ to run at any time and cleans up after itself.
 rm -rf ~/.multi-claude          # shim, profiles, and mappings
 ```
 
-Then drop the `PATH` line from your shell startup file. `~/.claude` is never touched, so your
-original account is exactly where it was.
+Then drop the `PATH` line from your shell startup file. `~/.claude` is never touched — a
+profile directory only holds *symlinks* into it, which `rm -rf` removes without following — so
+your original account and every session transcript are exactly where they were.
 
 Removing `~/.multi-claude` orphans any per-profile credentials macOS holds in the Keychain. To
 avoid that, `claude profile rm NAME` each profile first — that logs out properly.
