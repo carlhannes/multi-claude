@@ -61,6 +61,7 @@ claude profile              pick the profile for this directory
 claude profile list         show profiles, accounts and directory mappings
 claude profile use NAME     map this directory to NAME
 claude profile unset        drop this directory's mapping
+claude profile default [NAME]  show or set the default profile
 claude profile new NAME     create a profile
 claude profile rm NAME      delete a profile
 ```
@@ -97,6 +98,7 @@ directory to name — and then linking the session history back together, below.
 | `~/.claude/projects/` | Session transcripts and per-directory memory. Shared by every profile. |
 | `~/.claude/file-history/` | `/rewind` checkpoints. Shared by every profile. |
 | `~/.multi-claude/dirmap` | Tab-separated `directory` → `profile` records. |
+| `~/.multi-claude/default` | The default profile's name, set by `claude profile default`. |
 | `~/.multi-claude/default-removed` | Marker: the `~/.claude` profile was deleted. Remove it to restore. |
 
 Resolution stops at the first of these that applies:
@@ -109,10 +111,10 @@ Resolution stops at the first of these that applies:
    `claude profile list` says so when it sees this.
 4. **`CLAUDE_PROFILE` is set** — the one-off override.
 5. **A `dirmap` entry** for the current directory or its nearest mapped ancestor.
-6. **No mapping** — the picker appears if stdin is a terminal. Otherwise the `default` profile
-   is used and a note goes to stderr, so pipes, scripts, and CI behave exactly as they did
-   before installing this and can never block on a prompt. If `default` has been deleted, a
-   non-interactive run exits with an error naming the fix instead of guessing an account.
+6. **No mapping** — the picker appears if stdin is a terminal. Otherwise the default profile
+   (`claude profile default`) is used and a note goes to stderr, so pipes, scripts, and CI can
+   never block on a prompt. With no default profile set, a non-interactive run exits with an
+   error naming the fix instead of guessing an account.
 
 ### Why `default` means "unset"
 
@@ -129,7 +131,16 @@ This is also what makes profiles genuinely isolated on macOS, where credentials 
 Keychain rather than in a file. The wrapper never touches the Keychain itself: deleting a
 profile runs Claude Code's own `auth logout` against that profile.
 
-### Deleting `default`
+### The default profile
+
+`claude profile default NAME` names the profile that is listed first, selected by Enter in the
+picker, and used for a non-interactive run in a directory without a mapping. Until you set
+one, it is the `~/.claude` profile, `default`. The setting lives in `~/.multi-claude/default`
+and always names a concrete profile — as do directory mappings — so nothing can change which
+account a folder uses behind your back. Deleting the default profile clears the setting rather
+than guessing a successor; set a new one afterwards.
+
+#### Deleting `default`, the `~/.claude` profile
 
 Once another profile exists, `claude profile rm default` works like deleting any profile: it
 logs `~/.claude` out, drops its directory mappings so those folders ask again, and stops
@@ -138,8 +149,8 @@ history every profile shares, and its `settings.json` and `~/.claude.json`, whic
 A marker file, `~/.multi-claude/default-removed`, records the deletion; delete the marker to
 offer `~/.claude` again, or log into a new named profile instead.
 
-There is deliberately no replacement fallback. A mapping always names a concrete profile, so
-nothing can change which account a folder uses behind your back.
+If `default` is itself the default profile when deleted, no default is set afterwards;
+otherwise the setting is untouched.
 
 ### Session history is shared
 

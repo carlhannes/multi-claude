@@ -416,6 +416,76 @@ out=$(mc_pick "$TMP/proj" 'y
 check "rm of a directory profile logs out of its dir" "profiles/work] args=[auth logout]" "$(cat "$TMP/calls.log")"
 check_absent "with no default warning" "non-interactive runs" "$out"
 
+# --- default profile --------------------------------------------------------
+printf '\ndefault profile\n'
+reset_state
+DEFAULT_FILE="$TMP/home/.multi-claude/default"
+
+check_eq "with no pointer, the default is the ~/.claude profile" "default" "$(mc "$TMP/proj" profile default)"
+
+mc "$TMP/proj" profile new work >/dev/null 2>&1
+mc "$TMP/proj" profile new alpha >/dev/null 2>&1
+out=$(mc "$TMP/proj" profile default bogus)
+check "default rejects an unknown profile" "no such profile" "$out"
+out=$(mc "$TMP/proj" profile default ../x)
+check "default rejects a traversal name" "invalid profile name" "$out"
+check_eq "and nothing was written" "no" "$(test -f "$DEFAULT_FILE" && echo yes || echo no)"
+
+out=$(mc_pick "$TMP/elsewhere" '
+' profile)
+check "without a pointer, Enter selects the ~/.claude profile" "-> default" "$out"
+
+out=$(mc "$TMP/proj" profile default work)
+check "default NAME confirms" "default profile is now 'work'" "$out"
+check_eq "and writes the pointer" "work" "$(cat "$DEFAULT_FILE")"
+check_eq "default with no argument reads it back" "work" "$(mc "$TMP/proj" profile default)"
+
+out=$(mc_pick "$TMP/elsewhere" '1
+' profile)
+check "the default is the picker's #1" "-> work" "$out"
+out=$(mc_pick "$TMP/elsewhere" '
+' profile)
+check "Enter selects the default" "-> work" "$out"
+
+out=$(mc "$TMP/proj" --version </dev/null)
+check "unmapped non-interactive run uses the default" "profiles/work]" "$out"
+check "and says which" "using work" "$out"
+
+out=$(mc "$TMP/proj" profile list)
+check "list names the default in its footer" "Default profile: work" "$out"
+check "list puts the default first" "work" "$(printf '%s\n' "$out" | sed -n '2p')"
+
+# Remove the ~/.claude profile so the pointer is the only source of a default.
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm default)
+check "rm default is allowed while another profile is the default" "deleted profile 'default'" "$out"
+check_absent "and carries no default warning" "is the default profile" "$out"
+check_eq "the pointer is untouched" "work" "$(cat "$DEFAULT_FILE")"
+
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm work)
+check "rm of the default profile warns first" "is the default profile" "$out"
+check "and reports the cleared setting" "no default profile is set now" "$out"
+check_eq "the pointer file is gone" "no" "$(test -f "$DEFAULT_FILE" && echo yes || echo no)"
+
+out=$(mc "$TMP/proj" --version </dev/null)
+check "with no default, an unmapped non-interactive run fails" "claude profile default NAME" "$out"
+check_absent "and does not reach claude" "STUB" "$out"
+out=$(mc "$TMP/proj" profile default)
+check "default with no argument says none is set" "no default profile" "$out"
+out=$(mc "$TMP/proj" profile list)
+check "list says no default is set" "No default profile" "$out"
+out=$(mc_pick "$TMP/elsewhere" '
+' profile)
+check "with no default at all, Enter is not a choice" "invalid choice" "$out"
+
+# The only remaining profile, once made the default, cannot be deleted.
+mc "$TMP/proj" profile default alpha >/dev/null 2>&1
+out=$(mc_pick "$TMP/proj" 'y
+' profile rm alpha)
+check "the sole profile, when default, is refused" "only profile" "$out"
+check_eq "and survives" "yes" "$(test -d "$TMP/home/.multi-claude/profiles/alpha" && echo yes || echo no)"
+
 # --- result -----------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

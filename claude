@@ -11,6 +11,7 @@ MC_HOME="$HOME/.multi-claude"
 PROFILES_DIR="$MC_HOME/profiles"
 DIRMAP="$MC_HOME/dirmap"
 DEFAULT_REMOVED="$MC_HOME/default-removed"
+DEFAULT_FILE="$MC_HOME/default"
 SELF_MARKER="multi-claude-wrapper"
 TAG="multi-claude"
 
@@ -62,6 +63,22 @@ profile_exists() {
     [ -d "$PROFILES_DIR/$1" ]
 }
 
+# The default profile is listed first, chosen by Enter in the picker, and used
+# for an unmapped directory when no picker can be shown. Set with
+# `claude profile default NAME`; until then it is the ~/.claude profile.
+default_profile() {
+    if [ -f "$DEFAULT_FILE" ]; then
+        IFS= read -r p < "$DEFAULT_FILE" || :
+        if profile_exists "$p"; then
+            printf '%s\n' "$p"
+            return 0
+        fi
+    fi
+    if profile_exists default; then
+        printf 'default\n'
+    fi
+}
+
 valid_profile_name() {
     case $1 in
         '' | *[!A-Za-z0-9._-]* | -* | .*) return 1 ;;
@@ -70,11 +87,16 @@ valid_profile_name() {
 }
 
 list_profiles() {
-    profile_exists default && printf 'default\n'
+    def=$(default_profile)
+    [ -n "$def" ] && printf '%s\n' "$def"
+    if profile_exists default && [ "$def" != default ]; then
+        printf 'default\n'
+    fi
     if [ -d "$PROFILES_DIR" ]; then
         for p in "$PROFILES_DIR"/*; do
             [ -d "$p" ] || continue
             name=${p##*/}
+            [ "$name" = "$def" ] && continue
             if valid_profile_name "$name"; then
                 printf '%s\n' "$name"
             else
@@ -214,6 +236,7 @@ multi-claude — one Claude Code account per working directory.
   claude profile list         show profiles, accounts and directory mappings
   claude profile use NAME     map this directory to NAME
   claude profile unset        drop this directory's mapping
+  claude profile default [NAME]  show or set the default profile
   claude profile new NAME     create a profile
   claude profile rm NAME      delete a profile
 
@@ -245,8 +268,9 @@ cmd_list() {
     done
     printf '\nDirectories:\n'
     list_mappings
-    if profile_exists default; then
-        fallback="falls back to default"
+    def=$(default_profile)
+    if [ -n "$def" ]; then
+        fallback="falls back to $def"
     else
         fallback="the picker will ask; non-interactive runs fail"
     fi
@@ -256,6 +280,11 @@ cmd_list() {
         printf '\n%s is mapped to %s, which no longer exists — %s\n' "$RESOLVED_FROM" "$dangling" "$fallback"
     else
         printf '\nNo mapping for %s — %s\n' "$(pwd -P)" "$fallback"
+    fi
+    if [ -n "$def" ]; then
+        printf 'Default profile: %s\n' "$def"
+    else
+        printf 'No default profile — set one with: claude profile default NAME\n'
     fi
 }
 
@@ -298,21 +327,41 @@ cmd_unset() {
     fi
 }
 
+cmd_default() {
+    name=${1:-}
+    if [ -z "$name" ]; then
+        def=$(default_profile)
+        [ -n "$def" ] || die "no default profile — set one with: claude profile default NAME"
+        printf '%s\n' "$def"
+        return 0
+    fi
+    valid_profile_name "$name" || die "invalid profile name: '$name'"
+    profile_exists "$name" || die "no such profile: '$name'"
+    mkdir -p "$MC_HOME" || die "cannot create $MC_HOME"
+    printf '%s\n' "$name" > "$DEFAULT_FILE" || die "cannot write $DEFAULT_FILE"
+    msg "default profile is now '$name' — listed first, chosen by Enter in the picker, and used where no mapping exists and no picker can be shown"
+}
+
 cmd_rm() {
     name=${1:-}
     [ -n "$name" ] || die "usage: claude profile rm NAME"
     valid_profile_name "$name" || die "invalid profile name: '$name'"
     profile_exists "$name" || die "no such profile: '$name'"
     dir=$(profile_config_dir "$name")
-    if [ "$name" = default ] && [ "$(list_profiles | wc -l)" -le 1 ]; then
-        die "cannot delete 'default' when it is the only profile"
+    is_default=""
+    [ "$name" = "$(default_profile)" ] && is_default=1
+    if [ -n "$is_default" ] && [ "$(list_profiles | wc -l)" -le 1 ]; then
+        die "cannot delete '$name' — it is the default and the only profile"
     fi
     [ -t 0 ] || die "refusing to delete '$name' without an interactive confirmation"
 
+    if [ -n "$is_default" ]; then
+        msg "'$name' is the default profile — after this, non-interactive runs in unmapped directories fail until you set another with: claude profile default NAME"
+    fi
+
     if [ "$name" = default ]; then
         # ~/.claude stays: it hosts the shared history and Claude Code recreates it anyway.
-        printf '%s: delete profile "default" — log out of ~/.claude and stop offering it? Shared session history is kept.\n' "$TAG" >&2
-        printf '%s: after this, directories without a mapping ask which profile to use, and non-interactive runs there fail until mapped. [y/N] ' "$TAG" >&2
+        printf '%s: delete profile "default" — log out of ~/.claude and stop offering it? Shared session history is kept. [y/N] ' "$TAG" >&2
     else
         printf '%s: delete profile "%s" — its login and settings in %s? Shared session history is kept. [y/N] ' "$TAG" "$name" "$dir" >&2
     fi
@@ -339,6 +388,10 @@ cmd_rm() {
         rm -rf "$dir" || die "cannot remove $dir"
     fi
     dirmap_without_profile "$name" | dirmap_write || exit 1
+    if [ -f "$DEFAULT_FILE" ] && [ "$(cat "$DEFAULT_FILE")" = "$name" ]; then
+        rm -f "$DEFAULT_FILE"
+        msg "'$name' was the default profile — no default profile is set now"
+    fi
     msg "deleted profile '$name'"
     [ -z "$dir" ] && msg "~/.claude is kept — it holds the session history every profile shares"
     return 0
@@ -359,8 +412,10 @@ cmd_pick() {
         printf '  %d) %s\n' "$i" "$(describe_profile "$p")" >&2
     done
     printf '  n) create a new profile\n' >&2
-    printf 'Choice: ' >&2
+    def=$(default_profile)
+    if [ -n "$def" ]; then printf 'Choice [1]: ' >&2; else printf 'Choice: ' >&2; fi
     IFS= read -r ans || die "no selection"
+    [ -z "$ans" ] && [ -n "$def" ] && ans=1
 
     if [ "$ans" = n ] || [ "$ans" = N ]; then
         printf 'New profile name: ' >&2
@@ -395,6 +450,7 @@ if [ "${1-}" = profile ]; then
         list | ls)     cmd_list ;;
         use)           cmd_use "${1-}" ;;
         unset)         cmd_unset ;;
+        default)       cmd_default "${1-}" ;;
         new | create)  cmd_new "${1-}" ;;
         rm | remove | delete) cmd_rm "${1-}" ;;
         help | -h | --help) usage ;;
@@ -427,10 +483,13 @@ else
         if [ -t 0 ]; then
             cmd_pick
             profile=$PICKED
-        elif profile_exists default; then
-            msg "no profile mapped for $(pwd -P) — using default"
         else
-            die "no profile mapped for $(pwd -P) — run 'claude profile use NAME' there, or set CLAUDE_PROFILE"
+            profile=$(default_profile)
+            if [ -n "$profile" ]; then
+                msg "no profile mapped for $(pwd -P) — using $profile"
+            else
+                die "no profile mapped for $(pwd -P) — run 'claude profile use NAME' there, set CLAUDE_PROFILE, or set a default with 'claude profile default NAME'"
+            fi
         fi
     fi
 fi
